@@ -152,6 +152,8 @@ impl CubeColumn {
 pub trait V1CubeMetaExt {
     fn get_columns(&self) -> Vec<CubeColumn>;
 
+    fn get_scan_columns(&self) -> Vec<CubeColumn>;
+
     fn contains_member(&self, member_name: &str) -> bool;
 
     fn lookup_dimension(&self, member_name: &str) -> Option<&V1CubeMetaDimension>;
@@ -194,6 +196,30 @@ impl V1CubeMetaExt for V1CubeMeta {
                 column_type: "boolean".to_string(),
                 data_type: "boolean".to_string(),
                 can_be_null: false,
+            });
+        }
+
+        columns
+    }
+
+    fn get_scan_columns(&self) -> Vec<CubeColumn> {
+        let mut columns = Vec::new();
+
+        for measure in &self.measures {
+            columns.push(CubeColumn {
+                name: measure.get_real_name(),
+                data_type: measure.get_data_type(),
+                column_type: measure.get_column_type(),
+                can_be_null: false,
+            });
+        }
+
+        for dimension in &self.dimensions {
+            columns.push(CubeColumn {
+                name: dimension.get_real_name(),
+                data_type: dimension.get_data_type(),
+                column_type: dimension.get_column_type(),
+                can_be_null: dimension.mysql_can_be_null(),
             });
         }
 

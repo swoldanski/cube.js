@@ -195,6 +195,8 @@ crate::plan_to_language! {
             members: Vec<LogicalPlan>,
             filters: Vec<LogicalPlan>,
             order: Vec<LogicalPlan>,
+            limit: Option<usize>,
+            offset: Option<usize>,
         },
         Measure {
             name: String,
@@ -708,7 +710,7 @@ impl LogicalPlanToLanguageConverter {
         let mut rewrites = vec![
             rewrite!("cube-scan";
                 "(TableScan ?source_table_name ?table_name ?projection ?filters ?limit)" =>
-                "(Extension (CubeScan ?source_table_name CubeScanMembers CubeScanFilters CubeScanOrder))"
+                "(Extension (CubeScan ?source_table_name CubeScanMembers CubeScanFilters CubeScanOrder CubeScanLimit:None CubeScanOffset:None))"
                 if self.is_cube_table("?source_table_name")
             ),
             rewrite(
@@ -924,6 +926,8 @@ impl LogicalPlanToLanguageConverter {
                         cube_scan_members_empty_tail(),
                         "?filters",
                         "?orders",
+                        "?limit",
+                        "?offset",
                     ),
                     "?group_expr",
                     "?aggr_expr",
@@ -936,6 +940,8 @@ impl LogicalPlanToLanguageConverter {
                     ),
                     "?filters",
                     "?orders",
+                    "?limit",
+                    "?offset",
                 ),
             ),
             rewrite(
@@ -947,6 +953,8 @@ impl LogicalPlanToLanguageConverter {
                         cube_scan_members_empty_tail(),
                         "?filters",
                         "?orders",
+                        "?limit",
+                        "?offset",
                     ),
                     "?alias",
                 ),
@@ -955,13 +963,22 @@ impl LogicalPlanToLanguageConverter {
                     member_replacer("?expr", "?source_table_name"),
                     "?filters",
                     "?orders",
+                    "?limit",
+                    "?offset",
                 ),
             ),
             transforming_rewrite(
                 "push-down-projection",
                 projection(
                     "?expr",
-                    cube_scan("?source_table_name", "?members", "?filters", "?orders"),
+                    cube_scan(
+                        "?source_table_name",
+                        "?members",
+                        "?filters",
+                        "?orders",
+                        "?limit",
+                        "?offset",
+                    ),
                     "?alias",
                 ),
                 cube_scan(
@@ -969,6 +986,8 @@ impl LogicalPlanToLanguageConverter {
                     column_alias_replacer("?members", "?aliases", "?cube"),
                     "?filters",
                     "?orders",
+                    "?limit",
+                    "?offset",
                 ),
                 self.push_down_projection(
                     "?source_table_name",
@@ -977,6 +996,29 @@ impl LogicalPlanToLanguageConverter {
                     "?aliases",
                     "?cube",
                 ),
+            ),
+            transforming_rewrite(
+                "limit-push-down",
+                limit(
+                    "?limit",
+                    cube_scan(
+                        "?source_table_name",
+                        "?members",
+                        "?filters",
+                        "?orders",
+                        "?cube_limit",
+                        "?offset",
+                    ),
+                ),
+                cube_scan(
+                    "?source_table_name",
+                    "?members",
+                    "?filters",
+                    "?orders",
+                    "?new_limit",
+                    "?offset",
+                ),
+                self.push_down_limit("?limit", "?new_limit"),
             ),
             rewrite(
                 "alias-replacer-split",
@@ -1092,6 +1134,8 @@ impl LogicalPlanToLanguageConverter {
                         "?members",
                         "?filters",
                         "CubeScanOrder",
+                        "?limit",
+                        "?offset",
                     ),
                 ),
                 cube_scan(
@@ -1099,6 +1143,8 @@ impl LogicalPlanToLanguageConverter {
                     "?members",
                     "?filters",
                     order_replacer("?expr", "?aliases", "?cube"),
+                    "?limit",
+                    "?offset",
                 ),
                 self.push_down_sort(
                     "?source_table_name",
@@ -1206,6 +1252,8 @@ impl LogicalPlanToLanguageConverter {
                         "?time_dimension_date_range",
                     ),
                     "?order",
+                    "?limit",
+                    "?offset",
                 ),
                 cube_scan(
                     "?source_table_name",
@@ -1216,6 +1264,8 @@ impl LogicalPlanToLanguageConverter {
                     ),
                     "?filters",
                     "?order",
+                    "?limit",
+                    "?offset",
                 ),
             ),
             transforming_rewrite(
@@ -1671,6 +1721,28 @@ impl LogicalPlanToLanguageConverter {
         }
     }
 
+    fn push_down_limit(
+        &self,
+        limit_var: &'static str,
+        new_limit_var: &'static str,
+    ) -> impl Fn(&mut EGraph<LogicalPlanLanguage, LogicalPlanAnalysis>, &mut Subst) -> bool {
+        let limit_var = var!(limit_var);
+        let new_limit_var = var!(new_limit_var);
+        move |egraph, subst| {
+            for limit in var_iter!(egraph[subst[limit_var]], LimitN) {
+                let limit = *limit;
+                subst.insert(
+                    new_limit_var,
+                    egraph.add(LogicalPlanLanguage::CubeScanLimit(CubeScanLimit(Some(
+                        limit,
+                    )))),
+                );
+                return true;
+            }
+            false
+        }
+    }
+
     fn push_down_sort(
         &self,
         table_name_var: &'static str,
@@ -1992,6 +2064,8 @@ impl LogicalPlanToLanguageConverter {
                                     egraph[subst[time_dimension_date_range_var]],
                                     TimeDimensionDateRangeReplacerDateRange
                                 ) {
+                                    let time_dimension_date_range =
+                                        time_dimension_date_range.clone();
                                     subst.insert(
                                         output_date_range_var,
                                         egraph.add(LogicalPlanLanguage::TimeDimensionDateRange(
@@ -2047,6 +2121,7 @@ impl LogicalPlanToLanguageConverter {
                     if let Some((_, new_alias)) =
                         column_name_to_alias.iter().find(|(c, _)| c == &column_name)
                     {
+                        let new_alias = new_alias.clone();
                         let alias = egraph.add(LogicalPlanLanguage::ColumnExprColumn(
                             ColumnExprColumn(Column::from_name(new_alias.to_string())),
                         ));
@@ -2440,6 +2515,10 @@ fn udaf_expr(fun_name: impl Display, args: Vec<impl Display>) -> String {
     )
 }
 
+fn limit(n: impl Display, input: impl Display) -> String {
+    format!("(Limit {} {})", n, input)
+}
+
 fn aggregate(input: impl Display, group: impl Display, aggr: impl Display) -> String {
     format!("(Aggregate {} {} {})", input, group, aggr)
 }
@@ -2633,10 +2712,12 @@ fn cube_scan(
     members: impl Display,
     filters: impl Display,
     orders: impl Display,
+    limit: impl Display,
+    offset: impl Display,
 ) -> String {
     format!(
-        "(Extension (CubeScan {} {} {} {}))",
-        source_table_name, members, filters, orders
+        "(Extension (CubeScan {} {} {} {} {} {}))",
+        source_table_name, members, filters, orders, limit, offset
     )
 }
 
@@ -3852,6 +3933,9 @@ impl LanguageToLogicalPlanConverter {
                             None
                         };
                         query.segments = Some(Vec::new());
+                        query.limit =
+                            match_data_node!(node_by_id, cube_scan_params[4], CubeScanLimit)
+                                .map(|n| n as i32);
                         Arc::new(CubeScanNode::new(
                             Arc::new(DFSchema::new(fields)?),
                             query,
